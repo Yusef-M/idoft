@@ -41,7 +41,7 @@ jobs:
       run: |
         cd $HOME/swagger-core
         echo "=== Running test WITH NonDex (checking if FLAKY) ==="
-        mvn -pl modules/swagger-jaxrs2 edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=io.swagger.v3.jaxrs2.annotations.operations.AnnotatedOperationMethodTest#testOperationWithResponseExamples -DnondexRuns=10
+        mvn -pl modules/swagger-jaxrs2 edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=io.swagger.v3.jaxrs2.annotations.operations.AnnotatedOperationMethodTest#testOperationWithResponseExamples -DnondexRuns=100
       continue-on-error: true
     
     - name: Summary
