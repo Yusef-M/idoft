@@ -1,0 +1,54 @@
+name: Test JBPM Flaky Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-jbpm-flaky:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+    
+    - name: Clone jbpm repository
+      run: |
+        cd $HOME
+        git clone https://github.com/kiegroup/jbpm
+        cd jbpm
+        echo "Checking out latest commit on master/main..."
+        git checkout master || git checkout main
+        echo "Current commit: $(git rev-parse HEAD)"
+    
+    - name: Compile the project
+      run: |
+        cd $HOME/jbpm
+        mvn clean install -DskipTests -pl jbpm-case-mgmt/jbpm-case-mgmt-impl -am -Drat.skip -Dlicense.skip=true -Dcheckstyle.skip -Denforcer.skip=true
+      continue-on-error: false
+    
+    - name: Run test normally (should pass)
+      run: |
+        cd $HOME/jbpm
+        echo "=== Running test WITHOUT NonDex (should PASS) ==="
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl test -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testStartThenReopenActiveCase
+      continue-on-error: false
+    
+    - name: Run test with NonDex (checking for flakiness)
+      run: |
+        cd $HOME/jbpm
+        echo "=== Running test WITH NonDex (checking if FLAKY) ==="
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testStartThenReopenActiveCase -DnondexRuns=50
+      continue-on-error: true
+    
+    - name: Summary
+      run: |
+        echo "=== Test Flakiness Check Complete ==="
+        echo "If the NonDex step failed, the test is flaky!"
+        echo "Check the logs above to see the test results."
