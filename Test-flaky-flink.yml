@@ -1,0 +1,106 @@
+name: Test Flaky Flink Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-flink-flaky:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+    
+    - name: Clone Flink repository
+      run: |
+        cd $HOME
+        git clone https://github.com/apache/flink
+        cd flink
+        # Checkout the specific SHA where flaky test was detected
+        git checkout eaffd27d853e0cdef03f1af5016e00f950930a9
+        echo "Current commit:"
+        git rev-parse HEAD
+    
+    - name: Compile Flink project
+      run: |
+        cd $HOME/flink
+        # Flink is a large project, compile with more memory and skip checks
+        export MAVEN_OPTS="-Xmx2g -XX:MaxMetaspaceSize=512m"
+        mvn clean install -DskipTests \
+          -pl flink-table/flink-table-planner \
+          -am \
+          -Drat.skip=true \
+          -Dlicense.skip=true \
+          -Dcheckstyle.skip=true \
+          -Denforcer.skip=true \
+          -Dmaven.javadoc.skip=true \
+          2>&1 | tee compile.log
+        
+        echo "=== Compilation complete ==="
+        if grep -q "BUILD SUCCESS" compile.log; then
+          echo "✓ Compilation successful"
+        else
+          echo "✗ Compilation failed"
+          exit 1
+        fi
+    
+    - name: Run test WITHOUT NonDex (should pass)
+      run: |
+        cd $HOME/flink
+        echo "=== Running test WITHOUT NonDex ==="
+        export MAVEN_OPTS="-Xmx2g"
+        mvn -pl flink-table/flink-table-planner test \
+          -Dtest=org.apache.flink.table.planner.plan.stream.sql.join.LookupJoinTest#testJoinHintWithNoPropagatingToSubQuery \
+          2>&1 | tee test-without-nondex.log
+        
+        if grep -q "BUILD SUCCESS" test-without-nondex.log; then
+          echo "✓ Test PASSED without NonDex (as expected)"
+        else
+          echo "✗ Test FAILED without NonDex (unexpected)"
+          cat test-without-nondex.log
+          exit 1
+        fi
+    
+    - name: Run test WITH NonDex (should fail to detect flakiness)
+      run: |
+        cd $HOME/flink
+        echo "=== Running test WITH NonDex (100 runs) ==="
+        export MAVEN_OPTS="-Xmx2g"
+        mvn -pl flink-table/flink-table-planner \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.apache.flink.table.planner.plan.stream.sql.join.LookupJoinTest#testJoinHintWithNoPropagatingToSubQuery \
+          -DnondexRuns=100 \
+          2>&1 | tee test-with-nondex.log
+        
+        # Check if NonDex found failures
+        if grep -q "There are test failures" test-with-nondex.log; then
+          echo "✓ NonDex detected flakiness! (Test failed with NonDex)"
+          echo "SUCCESS: This is what we want - test passes normally but fails with NonDex"
+          exit 0
+        elif grep -q "BUILD SUCCESS" test-with-nondex.log; then
+          echo "⚠ Test PASSED with NonDex (no flakiness detected in 100 runs)"
+          echo "This test might not be flaky anymore, or needs more runs"
+          exit 1
+        else
+          echo "✗ Unexpected result from NonDex"
+          cat test-with-nondex.log
+          exit 1
+        fi
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-logs
+        path: |
+          /home/runner/flink/compile.log
+          /home/runner/flink/test-without-nondex.log
+          /home/runner/flink/test-with-nondex.log
