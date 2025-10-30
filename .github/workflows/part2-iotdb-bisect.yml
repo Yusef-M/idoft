@@ -93,11 +93,11 @@ jobs:
         git bisect start $BAD_COMMIT $GOOD_COMMIT
         
         # Create bisect test script
-        cat > /tmp/bisect-test.sh << 'BISECT_SCRIPT'
-#!/bin/bash
-set -e
-
-echo "=== Testing commit: $(git log --oneline -1) ==="
+        cat > /tmp/bisect-test.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        echo "=== Testing commit: $(git log --oneline -1) ==="
 
 # Compile
 mvn clean install -DskipTests -pl iotdb-core/datanode -am \
@@ -132,7 +132,7 @@ else
   echo "🟢 NOT FLAKY: Test passes with NonDex"
   exit 0  # Good commit (not flaky)
 fi
-BISECT_SCRIPT
+EOF
 
         chmod +x /tmp/bisect-test.sh
         
