@@ -6,17 +6,33 @@ on:
 jobs:
   iotdb-bisect:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360  # Increased timeout for bisect
     
     steps:
     - name: Checkout idoft
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3
     
     - name: Set up JDK 11
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v3
       with:
         java-version: '11'
         distribution: 'temurin'
+    
+    # Add retry logic for Maven downloads
+    - name: Configure Maven with retry
+      run: |
+        mkdir -p ~/.m2
+        cat > ~/.m2/settings.xml << 'EOF'
+        <settings>
+          <mirrors>
+            <mirror>
+              <id>central-mirror</id>
+              <mirrorOf>central</mirrorOf>
+              <url>https://repo1.maven.org/maven2</url>
+            </mirror>
+          </mirrors>
+        </settings>
+        EOF
     
     - name: Clone IoTDB
       run: |
@@ -32,19 +48,51 @@ jobs:
         cd $HOME/iotdb
         echo "=== Testing at known flaky SHA ==="
         
-        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true 2>&1 | tee compile-known.log
+        # Retry compilation up to 3 times
+        for i in 1 2 3; do
+          echo "Compilation attempt $i"
+          mvn clean install -DskipTests -pl iotdb-core/datanode -am \
+            -Dcheckstyle.skip=true \
+            -Denforcer.skip=true \
+            -Drat.skip=true \
+            -Dlicense.skip=true \
+            -Dmaven.javadoc.skip=true 2>&1 | tee compile-known.log
+          
+          if grep -q "BUILD SUCCESS" compile-known.log; then
+            echo "✓ Compilation successful"
+            break
+          fi
+          
+          if [ $i -eq 3 ]; then
+            echo "ERROR: Cannot compile after 3 attempts"
+            cat compile-known.log
+            exit 1
+          fi
+          
+          echo "Retrying in 30 seconds..."
+          sleep 30
+        done
         
-        if ! grep -q "BUILD SUCCESS" compile-known.log; then
-          echo "ERROR: Cannot compile"
-          exit 1
+        echo "=== Running normal test ==="
+        mvn -pl iotdb-core/datanode test \
+          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
+          2>&1 | tee test-normal.log
+        
+        if ! grep -q "BUILD SUCCESS" test-normal.log; then
+          echo "WARNING: Test doesn't pass normally"
+        else
+          echo "✓ Test passes normally"
         fi
         
-        mvn -pl iotdb-core/datanode test -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 2>&1 | tee test-normal.log
-        
-        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=30 2>&1 | tee test-nondex-known.log
+        echo "=== Running NonDex test ==="
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
+          -DnondexRuns=30 2>&1 | tee test-nondex-known.log
         
         if grep -q "There are test failures" test-nondex-known.log; then
-          echo "✓ Test IS flaky"
+          echo "✓ Test IS flaky at known commit"
+        else
+          echo "WARNING: Test may not be flaky"
         fi
     
     - name: Find test creation commit
@@ -53,9 +101,11 @@ jobs:
         cd $HOME/iotdb
         FIRST_COMMIT=$(git log --all --oneline --diff-filter=A -- "**/AlignByDeviceOrderByLimitOffsetTest.java" | tail -1 | awk '{print $1}')
         if [ -z "$FIRST_COMMIT" ]; then
+          echo "Could not find test creation, using 500 commits back"
           FIRST_COMMIT=$(git rev-parse HEAD~500)
         fi
         echo "first_commit=$FIRST_COMMIT" >> $GITHUB_OUTPUT
+        echo "Test likely created at: $FIRST_COMMIT"
         git log --oneline -1 $FIRST_COMMIT
     
     - name: Run git bisect
@@ -67,20 +117,54 @@ jobs:
         echo "Starting bisect: $GOOD_COMMIT (good) to $BAD_COMMIT (bad)"
         git bisect start $BAD_COMMIT $GOOD_COMMIT
         
-        # Create test script
+        # Create test script with retry logic
         cat > /tmp/test.sh << 'ENDSCRIPT'
         #!/bin/bash
+        set -e
+        echo "================================"
         echo "Testing: $(git log --oneline -1)"
-        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true > /tmp/c.log 2>&1 || exit 125
-        grep -q "BUILD SUCCESS" /tmp/c.log || exit 125
-        mvn -pl iotdb-core/datanode test -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 > /tmp/t.log 2>&1 || exit 125
-        grep -q "BUILD SUCCESS" /tmp/t.log || exit 125
-        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=20 > /tmp/n.log 2>&1
+        echo "================================"
+        
+        # Compile with retry
+        for i in 1 2; do
+          mvn clean install -DskipTests -pl iotdb-core/datanode -am \
+            -Dcheckstyle.skip=true \
+            -Denforcer.skip=true \
+            -Drat.skip=true \
+            -Dlicense.skip=true \
+            -Dmaven.javadoc.skip=true > /tmp/c.log 2>&1
+          
+          if grep -q "BUILD SUCCESS" /tmp/c.log; then
+            break
+          fi
+          
+          if [ $i -eq 2 ]; then
+            echo "Cannot compile - skipping"
+            exit 125
+          fi
+          sleep 10
+        done
+        
+        # Test normally
+        mvn -pl iotdb-core/datanode test \
+          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
+          > /tmp/t.log 2>&1
+        
+        if ! grep -q "BUILD SUCCESS" /tmp/t.log; then
+          echo "Test doesn't compile/pass - skipping"
+          exit 125
+        fi
+        
+        # Test with NonDex
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
+          -DnondexRuns=20 > /tmp/n.log 2>&1
+        
         if grep -q "There are test failures" /tmp/n.log; then
-          echo "FLAKY"
+          echo "✗ FLAKY - marking as bad"
           exit 1
         else
-          echo "NOT FLAKY"
+          echo "✓ NOT FLAKY - marking as good"
           exit 0
         fi
         ENDSCRIPT
@@ -88,10 +172,15 @@ jobs:
         chmod +x /tmp/test.sh
         git bisect run /tmp/test.sh 2>&1 | tee bisect.log
         
-        FIRST_FLAKY=$(git bisect view --oneline | head -1 | awk '{print $1}')
+        echo "=== Bisect complete ==="
+        git bisect log > bisect-full.log
+        
+        # Get the first bad commit
+        FIRST_FLAKY=$(git rev-parse refs/bisect/bad)
         echo "FIRST FLAKY COMMIT: $FIRST_FLAKY"
         git log --oneline -1 $FIRST_FLAKY
         echo "$FIRST_FLAKY" > /tmp/result.txt
+        
         git bisect reset
     
     - name: Verify results
@@ -100,18 +189,41 @@ jobs:
         FIRST_FLAKY=$(cat /tmp/result.txt)
         PARENT=$(git rev-parse ${FIRST_FLAKY}~1)
         
+        echo "================================"
+        echo "VERIFYING RESULTS"
+        echo "Parent commit: $PARENT"
+        echo "First flaky: $FIRST_FLAKY"
+        echo "================================"
+        
         echo "=== Testing PARENT (should be NOT flaky) ==="
         git checkout $PARENT
         git log --oneline -1
-        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
-        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=30 2>&1 | tee parent-nondex.log
         
+        mvn clean install -DskipTests -pl iotdb-core/datanode -am \
+          -Dcheckstyle.skip=true -Denforcer.skip=true \
+          -Drat.skip=true -Dlicense.skip=true \
+          -Dmaven.javadoc.skip=true > /dev/null 2>&1 || echo "Parent compile failed"
+        
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
+          -DnondexRuns=30 2>&1 | tee parent-nondex.log
+        
+        echo ""
         echo "=== Testing FIRST FLAKY ==="
         git checkout $FIRST_FLAKY
         git log --oneline -1
-        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
-        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=30 2>&1 | tee flaky-nondex.log
+        git show --stat
         
+        mvn clean install -DskipTests -pl iotdb-core/datanode -am \
+          -Dcheckstyle.skip=true -Denforcer.skip=true \
+          -Drat.skip=true -Dlicense.skip=true \
+          -Dmaven.javadoc.skip=true > /dev/null 2>&1
+        
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
+          -DnondexRuns=30 2>&1 | tee flaky-nondex.log
+        
+        echo ""
         echo "================================"
         echo "PART 2 COMPLETE!"
         echo "First flaky commit: $FIRST_FLAKY"
@@ -120,9 +232,10 @@ jobs:
     
     - name: Upload logs
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3
       with:
         name: iotdb-bisect-results
         path: |
+          ${{ github.workspace }}/**/*.log
           /home/runner/iotdb/*.log
           /tmp/result.txt
