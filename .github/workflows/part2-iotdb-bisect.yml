@@ -30,239 +30,99 @@ jobs:
     - name: Test at known flaky commit
       run: |
         cd $HOME/iotdb
-        echo "=== Testing at known flaky SHA: f94f99a48281519ddf156ba67cd1825d1491557c ==="
+        echo "=== Testing at known flaky SHA ==="
         
-        # Compile
-        mvn clean install -DskipTests -pl iotdb-core/datanode -am \
-          -Dcheckstyle.skip=true -Denforcer.skip=true 2>&1 | tee compile-known.log
+        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true 2>&1 | tee compile-known.log
         
         if ! grep -q "BUILD SUCCESS" compile-known.log; then
-          echo "ERROR: Cannot compile at known flaky commit"
+          echo "ERROR: Cannot compile"
           exit 1
         fi
         
-        # Test without NonDex
-        mvn -pl iotdb-core/datanode test \
-          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
-          2>&1 | tee test-normal-known.log
+        mvn -pl iotdb-core/datanode test -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 2>&1 | tee test-normal.log
         
-        # Test with NonDex
-        mvn -pl iotdb-core/datanode \
-          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
-          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
-          -DnondexRuns=30 \
-          2>&1 | tee test-nondex-known.log
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=30 2>&1 | tee test-nondex-known.log
         
         if grep -q "There are test failures" test-nondex-known.log; then
-          echo "✓ Confirmed: Test IS flaky at known commit"
-        else
-          echo "WARNING: Test is NOT flaky at known commit"
+          echo "✓ Test IS flaky"
         fi
     
-    - name: Find when test was created
+    - name: Find test creation commit
       id: test_created
       run: |
         cd $HOME/iotdb
-        echo "=== Finding when test was created ==="
-        
-        # Find first commit with the test file
         FIRST_COMMIT=$(git log --all --oneline --diff-filter=A -- "**/AlignByDeviceOrderByLimitOffsetTest.java" | tail -1 | awk '{print $1}')
-        
         if [ -z "$FIRST_COMMIT" ]; then
-          echo "Could not find when test was created, using a safe older commit"
-          # Go back 500 commits from known flaky
           FIRST_COMMIT=$(git rev-parse HEAD~500)
         fi
-        
-        echo "Starting bisect from commit: $FIRST_COMMIT"
-        git log --oneline -1 $FIRST_COMMIT
-        
         echo "first_commit=$FIRST_COMMIT" >> $GITHUB_OUTPUT
+        git log --oneline -1 $FIRST_COMMIT
     
-    - name: Automated git bisect
+    - name: Run git bisect
       run: |
         cd $HOME/iotdb
-        
         GOOD_COMMIT="${{ steps.test_created.outputs.first_commit }}"
         BAD_COMMIT="f94f99a48281519ddf156ba67cd1825d1491557c"
         
-        echo "=== Starting bisect ==="
-        echo "GOOD (old): $GOOD_COMMIT"
-        echo "BAD (flaky): $BAD_COMMIT"
-        
+        echo "Starting bisect: $GOOD_COMMIT (good) to $BAD_COMMIT (bad)"
         git bisect start $BAD_COMMIT $GOOD_COMMIT
         
-        # Create bisect test script
-        cat > /tmp/bisect-test.sh << 'EOF'
+        # Create test script
+        cat > /tmp/test.sh << 'ENDSCRIPT'
         #!/bin/bash
-        set -e
+        echo "Testing: $(git log --oneline -1)"
+        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true > /tmp/c.log 2>&1 || exit 125
+        grep -q "BUILD SUCCESS" /tmp/c.log || exit 125
+        mvn -pl iotdb-core/datanode test -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 > /tmp/t.log 2>&1 || exit 125
+        grep -q "BUILD SUCCESS" /tmp/t.log || exit 125
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=20 > /tmp/n.log 2>&1
+        if grep -q "There are test failures" /tmp/n.log; then
+          echo "FLAKY"
+          exit 1
+        else
+          echo "NOT FLAKY"
+          exit 0
+        fi
+        ENDSCRIPT
         
-        echo "=== Testing commit: $(git log --oneline -1) ==="
-
-# Compile
-mvn clean install -DskipTests -pl iotdb-core/datanode -am \
-  -Dcheckstyle.skip=true -Denforcer.skip=true > /tmp/compile.log 2>&1
-
-if ! grep -q "BUILD SUCCESS" /tmp/compile.log; then
-  echo "⚫ Does not compile"
-  exit 125  # Tell git bisect to skip this commit
-fi
-
-# Test without NonDex
-mvn -pl iotdb-core/datanode test \
-  -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
-  > /tmp/test-normal.log 2>&1
-
-if ! grep -q "BUILD SUCCESS" /tmp/test-normal.log; then
-  echo "⚫ Test fails without NonDex (broken test)"
-  exit 125  # Skip
-fi
-
-# Test with NonDex (fewer runs to speed up bisect)
-mvn -pl iotdb-core/datanode \
-  edu.illinois:nondex-maven-plugin:2.1.1:nondex \
-  -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
-  -DnondexRuns=20 \
-  > /tmp/test-nondex.log 2>&1
-
-if grep -q "There are test failures" /tmp/test-nondex.log; then
-  echo "🔴 FLAKY: Test fails with NonDex"
-  exit 1  # Bad commit (flaky)
-else
-  echo "🟢 NOT FLAKY: Test passes with NonDex"
-  exit 0  # Good commit (not flaky)
-fi
-EOF
-
-        chmod +x /tmp/bisect-test.sh
+        chmod +x /tmp/test.sh
+        git bisect run /tmp/test.sh 2>&1 | tee bisect.log
         
-        # Run bisect
-        git bisect run /tmp/bisect-test.sh 2>&1 | tee bisect-output.log
-        
-        echo "=== Bisect complete ==="
-        
-        # Get the first bad commit
         FIRST_FLAKY=$(git bisect view --oneline | head -1 | awk '{print $1}')
-        
-        echo "=================================="
         echo "FIRST FLAKY COMMIT: $FIRST_FLAKY"
-        echo "=================================="
         git log --oneline -1 $FIRST_FLAKY
-        echo "=================================="
-        
+        echo "$FIRST_FLAKY" > /tmp/result.txt
         git bisect reset
-        
-        # Save for next step
-        echo "$FIRST_FLAKY" > /tmp/first-flaky-commit.txt
     
-    - name: Verify the first flaky commit
+    - name: Verify results
       run: |
         cd $HOME/iotdb
+        FIRST_FLAKY=$(cat /tmp/result.txt)
+        PARENT=$(git rev-parse ${FIRST_FLAKY}~1)
         
-        FIRST_FLAKY=$(cat /tmp/first-flaky-commit.txt)
-        
-        echo "=== Verifying commit $FIRST_FLAKY ==="
-        git checkout $FIRST_FLAKY
-        
-        # Get parent commit
-        PARENT=$(git rev-parse HEAD~1)
-        
-        echo "Testing PARENT commit (should NOT be flaky):"
+        echo "=== Testing PARENT (should be NOT flaky) ==="
         git checkout $PARENT
         git log --oneline -1
+        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=30 2>&1 | tee parent-nondex.log
         
-        mvn clean install -DskipTests -pl iotdb-core/datanode -am \
-          -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
-        
-        mvn -pl iotdb-core/datanode \
-          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
-          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
-          -DnondexRuns=30 \
-          2>&1 | tee test-parent-nondex.log
-        
-        if grep -q "There are test failures" test-parent-nondex.log; then
-          echo "⚠️ WARNING: Parent is also flaky"
-          PARENT_STATUS="FLAKY"
-        else
-          echo "✓ Parent is NOT flaky (good)"
-          PARENT_STATUS="NOT_FLAKY"
-        fi
-        
-        echo "Testing FIRST FLAKY commit:"
+        echo "=== Testing FIRST FLAKY ==="
         git checkout $FIRST_FLAKY
         git log --oneline -1
+        mvn clean install -DskipTests -pl iotdb-core/datanode -am -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
+        mvn -pl iotdb-core/datanode edu.illinois:nondex-maven-plugin:2.1.1:nondex -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 -DnondexRuns=30 2>&1 | tee flaky-nondex.log
         
-        mvn clean install -DskipTests -pl iotdb-core/datanode -am \
-          -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
-        
-        mvn -pl iotdb-core/datanode \
-          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
-          -Dtest=org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest#orderByTimeTest2 \
-          -DnondexRuns=30 \
-          2>&1 | tee test-first-flaky-nondex.log
-        
-        if grep -q "There are test failures" test-first-flaky-nondex.log; then
-          echo "✓ First flaky commit IS flaky (correct)"
-          FLAKY_STATUS="FLAKY"
-        else
-          echo "⚠️ WARNING: First flaky commit is NOT flaky"
-          FLAKY_STATUS="NOT_FLAKY"
-        fi
-        
-        echo "=================================="
-        echo "VERIFICATION RESULTS:"
-        echo "Parent commit ($PARENT): $PARENT_STATUS"
-        echo "First flaky commit ($FIRST_FLAKY): $FLAKY_STATUS"
-        echo "=================================="
-        
-        if [ "$PARENT_STATUS" = "NOT_FLAKY" ] && [ "$FLAKY_STATUS" = "FLAKY" ]; then
-          echo "✓✓✓ SUCCESS: Found the exact commit where test became flaky!"
-        else
-          echo "⚠️ Results are ambiguous, may need more NonDex runs"
-        fi
+        echo "================================"
+        echo "PART 2 COMPLETE!"
+        echo "First flaky commit: $FIRST_FLAKY"
+        echo "URL: https://github.com/apache/iotdb/commit/$FIRST_FLAKY"
+        echo "================================"
     
-    - name: Generate final report
-      if: always()
-      run: |
-        cd $HOME/iotdb
-        
-        FIRST_FLAKY=$(cat /tmp/first-flaky-commit.txt || echo "UNKNOWN")
-        
-        echo "=================================="
-        echo "PART 2 FINAL REPORT - IoTDB"
-        echo "=================================="
-        echo ""
-        echo "Test Information:"
-        echo "https://github.com/apache/iotdb,f94f99a48281519ddf156ba67cd1825d1491557c,iotdb-core/datanode,org.apache.iotdb.db.queryengine.plan.planner.distribution.AlignByDeviceOrderByLimitOffsetTest.orderByTimeTest2,ID,,,"
-        echo ""
-        echo "First Flaky Commit: $FIRST_FLAKY"
-        echo ""
-        echo "Commit details:"
-        git log --format=fuller -1 $FIRST_FLAKY || echo "Could not show commit details"
-        echo ""
-        echo "=================================="
-        echo ""
-        echo "Files changed in this commit:"
-        git show --name-only --pretty="" $FIRST_FLAKY
-        echo ""
-        echo "=================================="
-        echo ""
-        echo "Next steps for submission:"
-        echo "1. Download artifacts from this workflow run"
-        echo "2. Find test-parent-nondex.log (parent should pass)"
-        echo "3. Find test-first-flaky-nondex.log (should fail)"
-        echo "4. Create submission with:"
-        echo "   - URL: https://github.com/apache/iotdb/commit/$FIRST_FLAKY"
-        echo "   - Description of why it became flaky"
-        echo "   - Both log files"
-        echo "=================================="
-    
-    - name: Upload all logs
+    - name: Upload logs
       if: always()
       uses: actions/upload-artifact@v3
       with:
-        name: part2-iotdb-bisect-logs
+        name: iotdb-bisect-results
         path: |
           /home/runner/iotdb/*.log
-          /home/runner/iotdb/bisect-output.log
-          /tmp/*.txt
+          /tmp/result.txt
