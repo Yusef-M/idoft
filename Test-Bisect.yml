@@ -1,0 +1,262 @@
+name: Part 2 - Find First Flaky Commit (Automated Bisect)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  automated-bisect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    
+    steps:
+    - name: Checkout idoft
+      uses: actions/checkout@v3
+    
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+    
+    - name: Clone spring-cloud-gcp
+      run: |
+        cd $HOME
+        git clone https://github.com/GoogleCloudPlatform/spring-cloud-gcp
+        cd spring-cloud-gcp
+        git checkout cf556f623ef4ad2872496a4486dc3a9a8b8e80bc
+        echo "=== Checked out known flaky commit ==="
+        git log --oneline -1
+    
+    - name: Test at known flaky commit
+      run: |
+        cd $HOME/spring-cloud-gcp
+        echo "=== Testing at known flaky SHA: cf556f623ef4ad2872496a4486dc3a9a8b8e80bc ==="
+        
+        # Compile
+        mvn clean install -DskipTests -pl spring-cloud-gcp-data-spanner -am \
+          -Dcheckstyle.skip=true -Denforcer.skip=true 2>&1 | tee compile-known.log
+        
+        if ! grep -q "BUILD SUCCESS" compile-known.log; then
+          echo "ERROR: Cannot compile at known flaky commit"
+          exit 1
+        fi
+        
+        # Test without NonDex
+        mvn -pl spring-cloud-gcp-data-spanner test \
+          -Dtest=com.google.cloud.spring.data.spanner.core.admin.SpannerSchemaUtilsTests#getCreateDdlTest \
+          2>&1 | tee test-normal-known.log
+        
+        # Test with NonDex
+        mvn -pl spring-cloud-gcp-data-spanner \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=com.google.cloud.spring.data.spanner.core.admin.SpannerSchemaUtilsTests#getCreateDdlTest \
+          -DnondexRuns=50 \
+          2>&1 | tee test-nondex-known.log
+        
+        if grep -q "There are test failures" test-nondex-known.log; then
+          echo "✓ Confirmed: Test IS flaky at known commit"
+        else
+          echo "WARNING: Test is NOT flaky at known commit (may have been fixed)"
+          echo "Will continue bisect anyway to find when it became flaky originally"
+        fi
+    
+    - name: Find when test was created
+      id: test_created
+      run: |
+        cd $HOME/spring-cloud-gcp
+        echo "=== Finding when test was created ==="
+        
+        # Find first commit with the test file
+        FIRST_COMMIT=$(git log --all --oneline --diff-filter=A -- "**/SpannerSchemaUtilsTests.java" | tail -1 | awk '{print $1}')
+        
+        if [ -z "$FIRST_COMMIT" ]; then
+          echo "ERROR: Could not find when test was created"
+          FIRST_COMMIT=$(git rev-list --max-parents=0 HEAD)
+        fi
+        
+        echo "Test file first appeared in commit: $FIRST_COMMIT"
+        git log --oneline -1 $FIRST_COMMIT
+        
+        echo "first_commit=$FIRST_COMMIT" >> $GITHUB_OUTPUT
+    
+    - name: Automated git bisect
+      run: |
+        cd $HOME/spring-cloud-gcp
+        
+        GOOD_COMMIT="${{ steps.test_created.outputs.first_commit }}"
+        BAD_COMMIT="cf556f623ef4ad2872496a4486dc3a9a8b8e80bc"
+        
+        echo "=== Starting bisect ==="
+        echo "GOOD (old): $GOOD_COMMIT"
+        echo "BAD (flaky): $BAD_COMMIT"
+        
+        git bisect start $BAD_COMMIT $GOOD_COMMIT
+        
+        # Create bisect test script
+        cat > /tmp/bisect-test.sh << 'BISECT_SCRIPT'
+#!/bin/bash
+set -e
+
+echo "=== Testing commit: $(git log --oneline -1) ==="
+
+# Compile
+mvn clean install -DskipTests -pl spring-cloud-gcp-data-spanner -am \
+  -Dcheckstyle.skip=true -Denforcer.skip=true > /tmp/compile.log 2>&1
+
+if ! grep -q "BUILD SUCCESS" /tmp/compile.log; then
+  echo "⚫ Does not compile"
+  exit 125  # Tell git bisect to skip this commit
+fi
+
+# Test without NonDex
+mvn -pl spring-cloud-gcp-data-spanner test \
+  -Dtest=com.google.cloud.spring.data.spanner.core.admin.SpannerSchemaUtilsTests#getCreateDdlTest \
+  > /tmp/test-normal.log 2>&1
+
+if ! grep -q "BUILD SUCCESS" /tmp/test-normal.log; then
+  echo "⚫ Test fails without NonDex (broken test)"
+  exit 125  # Skip
+fi
+
+# Test with NonDex
+mvn -pl spring-cloud-gcp-data-spanner \
+  edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+  -Dtest=com.google.cloud.spring.data.spanner.core.admin.SpannerSchemaUtilsTests#getCreateDdlTest \
+  -DnondexRuns=30 \
+  > /tmp/test-nondex.log 2>&1
+
+if grep -q "There are test failures" /tmp/test-nondex.log; then
+  echo "🔴 FLAKY: Test fails with NonDex"
+  exit 1  # Bad commit (flaky)
+else
+  echo "🟢 NOT FLAKY: Test passes with NonDex"
+  exit 0  # Good commit (not flaky)
+fi
+BISECT_SCRIPT
+
+        chmod +x /tmp/bisect-test.sh
+        
+        # Run bisect
+        git bisect run /tmp/bisect-test.sh 2>&1 | tee bisect-output.log
+        
+        echo "=== Bisect complete ==="
+        
+        # Get the first bad commit
+        FIRST_FLAKY=$(git bisect view --oneline | head -1 | awk '{print $1}')
+        
+        echo "=================================="
+        echo "FIRST FLAKY COMMIT: $FIRST_FLAKY"
+        echo "=================================="
+        git log --oneline -1 $FIRST_FLAKY
+        echo "=================================="
+        
+        git bisect reset
+        
+        # Save for next step
+        echo "$FIRST_FLAKY" > /tmp/first-flaky-commit.txt
+    
+    - name: Verify the first flaky commit
+      run: |
+        cd $HOME/spring-cloud-gcp
+        
+        FIRST_FLAKY=$(cat /tmp/first-flaky-commit.txt)
+        
+        echo "=== Verifying commit $FIRST_FLAKY ==="
+        git checkout $FIRST_FLAKY
+        
+        # Get parent commit
+        PARENT=$(git rev-parse HEAD~1)
+        
+        echo "Testing PARENT commit (should NOT be flaky):"
+        git checkout $PARENT
+        git log --oneline -1
+        
+        mvn clean install -DskipTests -pl spring-cloud-gcp-data-spanner -am \
+          -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
+        
+        mvn -pl spring-cloud-gcp-data-spanner \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=com.google.cloud.spring.data.spanner.core.admin.SpannerSchemaUtilsTests#getCreateDdlTest \
+          -DnondexRuns=30 \
+          2>&1 | tee test-parent-nondex.log
+        
+        if grep -q "There are test failures" test-parent-nondex.log; then
+          echo "⚠️ WARNING: Parent is also flaky"
+          PARENT_STATUS="FLAKY"
+        else
+          echo "✓ Parent is NOT flaky (good)"
+          PARENT_STATUS="NOT_FLAKY"
+        fi
+        
+        echo "Testing FIRST FLAKY commit:"
+        git checkout $FIRST_FLAKY
+        git log --oneline -1
+        
+        mvn clean install -DskipTests -pl spring-cloud-gcp-data-spanner -am \
+          -Dcheckstyle.skip=true -Denforcer.skip=true > /dev/null 2>&1
+        
+        mvn -pl spring-cloud-gcp-data-spanner \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=com.google.cloud.spring.data.spanner.core.admin.SpannerSchemaUtilsTests#getCreateDdlTest \
+          -DnondexRuns=30 \
+          2>&1 | tee test-first-flaky-nondex.log
+        
+        if grep -q "There are test failures" test-first-flaky-nondex.log; then
+          echo "✓ First flaky commit IS flaky (correct)"
+          FLAKY_STATUS="FLAKY"
+        else
+          echo "⚠️ WARNING: First flaky commit is NOT flaky"
+          FLAKY_STATUS="NOT_FLAKY"
+        fi
+        
+        echo "=================================="
+        echo "VERIFICATION RESULTS:"
+        echo "Parent commit ($PARENT): $PARENT_STATUS"
+        echo "First flaky commit ($FIRST_FLAKY): $FLAKY_STATUS"
+        echo "=================================="
+        
+        if [ "$PARENT_STATUS" = "NOT_FLAKY" ] && [ "$FLAKY_STATUS" = "FLAKY" ]; then
+          echo "✓✓✓ SUCCESS: Found the exact commit where test became flaky!"
+        else
+          echo "⚠️ Results are ambiguous, may need more NonDex runs"
+        fi
+    
+    - name: Generate final report
+      if: always()
+      run: |
+        cd $HOME/spring-cloud-gcp
+        
+        FIRST_FLAKY=$(cat /tmp/first-flaky-commit.txt || echo "UNKNOWN")
+        
+        echo "=================================="
+        echo "PART 2 FINAL REPORT"
+        echo "=================================="
+        echo ""
+        echo "Test Information:"
+        echo "https://github.com/GoogleCloudPlatform/spring-cloud-gcp,cf556f623ef4ad2872496a4486dc3a9a8b8e80bc,spring-cloud-gcp-data-spanner,com.google.cloud.spring.data.spanner.core.admin.SpannerSchemaUtilsTests.getCreateDdlTest,ID,,,"
+        echo ""
+        echo "First Flaky Commit: $FIRST_FLAKY"
+        echo ""
+        git log --format=fuller -1 $FIRST_FLAKY || echo "Could not show commit details"
+        echo ""
+        echo "=================================="
+        echo ""
+        echo "Next steps for submission:"
+        echo "1. Download artifacts from this workflow run"
+        echo "2. Find test-parent-nondex.log (parent should pass)"
+        echo "3. Find test-first-flaky-nondex.log (should fail)"
+        echo "4. Create submission with:"
+        echo "   - URL: https://github.com/GoogleCloudPlatform/spring-cloud-gcp/commit/$FIRST_FLAKY"
+        echo "   - Description of why it became flaky"
+        echo "   - Both log files"
+        echo "=================================="
+    
+    - name: Upload all logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: part2-bisect-logs
+        path: |
+          /home/runner/spring-cloud-gcp/*.log
+          /home/runner/spring-cloud-gcp/bisect-output.log
+          /tmp/*.txt
