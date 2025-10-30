@@ -1,0 +1,158 @@
+name: Test Multiple JBPM Flaky Tests
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-jbpm-multiple:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+    
+    - name: Clone and compile jbpm repository
+      run: |
+        cd $HOME
+        git clone https://github.com/kiegroup/jbpm
+        cd jbpm
+        git checkout f7e80e82b7670c09485ce83869a287ef51dcbb59c
+        echo "=== Compiling JBPM ==="
+        mvn clean install -DskipTests \
+          -pl jbpm-case-mgmt/jbpm-case-mgmt-impl,jbpm-services/jbpm-kie-services \
+          -am \
+          -Drat.skip=true \
+          -Dlicense.skip=true \
+          -Dcheckstyle.skip=true \
+          -Denforcer.skip=true \
+          2>&1 | tee compile.log
+    
+    - name: Test 1 - testStartThenReopenActiveCase
+      continue-on-error: true
+      run: |
+        cd $HOME/jbpm
+        echo "=== Testing testStartThenReopenActiveCase ==="
+        
+        # Run without NonDex
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl test \
+          -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testStartThenReopenActiveCase \
+          2>&1 | tee test1-normal.log
+        
+        # Run with NonDex
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testStartThenReopenActiveCase \
+          -DnondexRuns=50 \
+          2>&1 | tee test1-nondex.log
+        
+        if grep -q "There are test failures" test1-nondex.log; then
+          echo "✓✓✓ TEST 1 IS FLAKY! ✓✓✓"
+          echo "FLAKY_TEST=testStartThenReopenActiveCase" >> $GITHUB_ENV
+          exit 0
+        fi
+    
+    - name: Test 2 - testCaseWithRequiredRestrictedCaseFileItem
+      continue-on-error: true
+      if: env.FLAKY_TEST == ''
+      run: |
+        cd $HOME/jbpm
+        echo "=== Testing testCaseWithRequiredRestrictedCaseFileItem ==="
+        
+        # Run without NonDex
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl test \
+          -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testCaseWithRequiredRestrictedCaseFileItem \
+          2>&1 | tee test2-normal.log
+        
+        # Run with NonDex
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testCaseWithRequiredRestrictedCaseFileItem \
+          -DnondexRuns=50 \
+          2>&1 | tee test2-nondex.log
+        
+        if grep -q "There are test failures" test2-nondex.log; then
+          echo "✓✓✓ TEST 2 IS FLAKY! ✓✓✓"
+          echo "FLAKY_TEST=testCaseWithRequiredRestrictedCaseFileItem" >> $GITHUB_ENV
+          exit 0
+        fi
+    
+    - name: Test 3 - testAddMultipleDynamicTasksToStage
+      continue-on-error: true
+      if: env.FLAKY_TEST == ''
+      run: |
+        cd $HOME/jbpm
+        echo "=== Testing testAddMultipleDynamicTasksToStage ==="
+        
+        # Run without NonDex
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl test \
+          -Dtest=org.jbpm.casemgmt.impl.CaseDynamicNodesTest#testAddMultipleDynamicTasksToStage \
+          2>&1 | tee test3-normal.log
+        
+        # Run with NonDex
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.jbpm.casemgmt.impl.CaseDynamicNodesTest#testAddMultipleDynamicTasksToStage \
+          -DnondexRuns=50 \
+          2>&1 | tee test3-nondex.log
+        
+        if grep -q "There are test failures" test3-nondex.log; then
+          echo "✓✓✓ TEST 3 IS FLAKY! ✓✓✓"
+          echo "FLAKY_TEST=testAddMultipleDynamicTasksToStage" >> $GITHUB_ENV
+          exit 0
+        fi
+    
+    - name: Test 4 - testTimerNameAndTimerId
+      continue-on-error: true
+      if: env.FLAKY_TEST == ''
+      run: |
+        cd $HOME/jbpm
+        echo "=== Testing testTimerNameAndTimerId ==="
+        
+        # Run without NonDex
+        mvn -pl jbpm-services/jbpm-kie-services test \
+          -Dtest=org.jbpm.kie.services.impl.admin.ProcessInstanceAdminServiceImpl#testTimerNameAndTimerId \
+          2>&1 | tee test4-normal.log
+        
+        # Run with NonDex
+        mvn -pl jbpm-services/jbpm-kie-services \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.jbpm.kie.services.impl.admin.ProcessInstanceAdminServiceImpl#testTimerNameAndTimerId \
+          -DnondexRuns=50 \
+          2>&1 | tee test4-nondex.log
+        
+        if grep -q "There are test failures" test4-nondex.log; then
+          echo "✓✓✓ TEST 4 IS FLAKY! ✓✓✓"
+          echo "FLAKY_TEST=testTimerNameAndTimerId" >> $GITHUB_ENV
+          exit 0
+        fi
+    
+    - name: Final Result
+      run: |
+        if [ -n "$FLAKY_TEST" ]; then
+          echo "=========================================="
+          echo "SUCCESS! Found flaky test: $FLAKY_TEST"
+          echo "=========================================="
+          exit 0
+        else
+          echo "=========================================="
+          echo "No flaky tests detected in this run"
+          echo "Consider increasing NonDex runs or trying other tests"
+          echo "=========================================="
+          exit 1
+        fi
+    
+    - name: Upload all logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: all-test-logs
+        path: |
+          /home/runner/jbpm/*.log
