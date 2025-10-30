@@ -1,0 +1,101 @@
+name: Test Flaky JBPM Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-jbpm-flaky:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+    
+    - name: Clone jbpm repository
+      run: |
+        cd $HOME
+        git clone https://github.com/kiegroup/jbpm
+        cd jbpm
+        # Checkout the specific SHA where flaky test was detected
+        git checkout f7e80e82b7670c09485ce83869a287ef51dcbb59c
+        echo "Current commit:"
+        git rev-parse HEAD
+    
+    - name: Compile jbpm project
+      run: |
+        cd $HOME/jbpm
+        # Compile the module and its dependencies
+        # Using common flags to skip checks that might cause issues
+        mvn clean install -DskipTests -pl jbpm-case-mgmt/jbpm-case-mgmt-impl -am \
+          -Drat.skip=true \
+          -Dlicense.skip=true \
+          -Dcheckstyle.skip=true \
+          -Denforcer.skip=true \
+          2>&1 | tee compile.log
+        
+        echo "=== Compilation complete ==="
+        if grep -q "BUILD SUCCESS" compile.log; then
+          echo "✓ Compilation successful"
+        else
+          echo "✗ Compilation failed"
+          exit 1
+        fi
+    
+    - name: Run test WITHOUT NonDex (should pass)
+      run: |
+        cd $HOME/jbpm
+        echo "=== Running test WITHOUT NonDex ==="
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl test \
+          -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testStartThenReopenActiveCase \
+          2>&1 | tee test-without-nondex.log
+        
+        if grep -q "BUILD SUCCESS" test-without-nondex.log; then
+          echo "✓ Test PASSED without NonDex (as expected)"
+        else
+          echo "✗ Test FAILED without NonDex (unexpected)"
+          cat test-without-nondex.log
+          exit 1
+        fi
+    
+    - name: Run test WITH NonDex (should fail to detect flakiness)
+      run: |
+        cd $HOME/jbpm
+        echo "=== Running test WITH NonDex (100 runs) ==="
+        mvn -pl jbpm-case-mgmt/jbpm-case-mgmt-impl \
+          edu.illinois:nondex-maven-plugin:2.1.1:nondex \
+          -Dtest=org.jbpm.casemgmt.impl.CaseServiceImplTest#testStartThenReopenActiveCase \
+          -DnondexRuns=100 \
+          2>&1 | tee test-with-nondex.log
+        
+        # Check if NonDex found failures
+        if grep -q "There are test failures" test-with-nondex.log; then
+          echo "✓ NonDex detected flakiness! (Test failed with NonDex)"
+          echo "SUCCESS: This is what we want - test passes normally but fails with NonDex"
+          exit 0
+        elif grep -q "BUILD SUCCESS" test-with-nondex.log; then
+          echo "⚠ Test PASSED with NonDex (no flakiness detected in 100 runs)"
+          echo "This test might not be flaky anymore, or needs more runs"
+          exit 1
+        else
+          echo "✗ Unexpected result from NonDex"
+          cat test-with-nondex.log
+          exit 1
+        fi
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-logs
+        path: |
+          /home/runner/jbpm/compile.log
+          /home/runner/jbpm/test-without-nondex.log
+          /home/runner/jbpm/test-with-nondex.log
